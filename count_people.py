@@ -1,118 +1,80 @@
 """
-Door-aware people counter for an oblique 45-degree entrance camera.
+Count people across an entire video using YOLOv8 + DeepSORT.
 
-Why this is different from a simple vertical ROI line:
-    A person walking from the bathroom to the water dispenser can cross the same
-    line as a real door transition. This script counts only tracks that show
-    door intent:
-
-    OUT: the track is first seen/stabilized in the doorway zone, then reaches
-         the outside approach floor.
-    IN : the track is first seen/stabilized on the outside approach floor, then
-         reaches the doorway zone.
+This does not count people per frame and does not count IN/OUT direction.
+Each stable DeepSORT tracking ID is counted once. Short occlusions/overlaps keep
+the same ID, but a person who leaves the frame and comes back later can be
+counted again as a new track.
 
 Install:
-    pip install ultralytics opencv-python
+    pip install ultralytics opencv-python deep-sort-realtime
 
 Run:
     python count_people.py
 
 Controls:
     q - quit
-    r - reset counts
+    r - reset total count
     p - pause/play
-"""
+""" 
 
 from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-import json
 import math
-from pathlib import Path
-import time
 
 import cv2
-import numpy as np
+from deep_sort_realtime.deepsort_tracker import DeepSort
 from ultralytics import YOLO
 
 
 # =========================
 # Config
 # =========================
-VIDEO_SOURCE = "entrance.mov"
+VIDEO_SOURCE = "entrance_stable.mp4"
 MODEL_PATH = "yolov8m.pt"
-ROI_CONFIG_PATH = Path("roi_config.json")
 
 PERSON_CLASS_ID = 0
-CONF_THRESHOLD = 0.65
+CONF_THRESHOLD = 0.8
 IOU_THRESHOLD = 0.55
 IMG_SIZE = 960
-TRACKER = "bytetrack.yaml"
 
-# Visual reference for the doorway edge/gate. The actual count is decided from
-# the zone transition because a short line is fragile with this oblique camera.
-# Current value comes from roi_line_config.txt.
-DOOR_GATE_START = (846, 98)
-DOOR_GATE_END = (818, 358)
+# DeepSORT settings:
+# max_age keeps the same ID through short occlusion. If a person disappears for
+# longer than this many frames, DeepSORT deletes the track; if they return later,
+# they can be counted again as a new person pass.
+DEEPSORT_MAX_AGE = 80
+DEEPSORT_N_INIT = 3
+DEEPSORT_MAX_COSINE_DISTANCE = 0.25
+DEEPSORT_NN_BUDGET = 200
 
-# Main area inside the doorway/open door. Tune these points if your camera
-# moves. Use the person's foot point, so include the floor just inside the door.
-DOOR_ZONE = np.array(
-    [
-        (420, 120),
-        (930, 135),
-        (910, 735),
-        (425, 800),
-    ],
-    dtype=np.int32,
-)
+# If a counted ID disappears for a few frames and then reappears from a frame
+# edge, treat it as a new person entering the frame.
+REENTRY_MIN_ABSENT_FRAMES = 2
 
-# Outside floor immediately in front of the door. A real entrance normally moves
-# between this area and DOOR_ZONE. It deliberately avoids the water dispenser.
-APPROACH_ZONE = np.array(
-    [
-        (210, 800),
-        (930, 725),
-        (1040, 980),
-        (120, 1030),
-    ],
-    dtype=np.int32,
-)
+# Reused IDs that jump a long distance are probably a different person.
+ID_SWITCH_DISTANCE_PX = 160
 
-# Visual/no-count zone for the dispenser side. Tracks here are not counted
-# unless they also had doorway evidence first.
-WATER_DISPENSER_ZONE = np.array(
-    [
-        (950, 270),
-        (1515, 285),
-        (1585, 850),
-        (890, 880),
-    ],
-    dtype=np.int32,
-)
+# A person appearing inside this edge band is treated as entering the frame.
+ENTRY_EDGE_MARGIN_RATIO = 0.08
 
-ZONE_KEY_MAP = {
-    "door_zone": "DOOR_ZONE",
-    "approach_zone": "APPROACH_ZONE",
-    "water_zone": "WATER_DISPENSER_ZONE",
-}
+# A track must be detected this many frames before it becomes a counted person.
+# This filters one-frame false detections.
+MIN_TRACK_FRAMES = 5
 
-MIN_DOOR_HITS = 3
-MIN_APPROACH_HITS = 3
-MIN_TRACK_POINTS = 5
-MIN_MOVEMENT_PX = 35
-COUNT_COOLDOWN_SEC = 1.2
+# If a person is visible for enough frames but barely moves, still count them
+# after this many detections. Useful when people stand in line.
+STATIONARY_COUNT_FRAMES = 18
+
+# If a person moves at least this far, count them as soon as MIN_TRACK_FRAMES is met.
+MIN_MOVEMENT_PX = 25
+
 TRAIL_LENGTH = 48
 MAX_STALE_TRACKS = 120
 DISPLAY_WIDTH = 1300
 
 
-CLR_DOOR = (0, 210, 255)
-CLR_APPROACH = (70, 220, 70)
-CLR_WATER = (255, 170, 0)
-CLR_IN = (40, 210, 80)
-CLR_OUT = (40, 90, 235)
 CLR_COUNTED = (0, 220, 0)
 CLR_NOT_COUNTED = (0, 0, 255)
 CLR_TEXT = (245, 245, 245)
@@ -122,12 +84,12 @@ CLR_BG = (25, 25, 25)
 @dataclass
 class TrackState:
     points: deque[tuple[int, int]] = field(default_factory=lambda: deque(maxlen=TRAIL_LENGTH))
-    door_hits: int = 0
-    approach_hits: int = 0
-    water_hits: int = 0
-    counted_in: bool = False
-    counted_out: bool = False
+    frames_seen: int = 0
+    max_conf: float = 0.0
+    counted: bool = False
+    pass_count: int = 0
     last_seen_frame: int = 0
+    last_box: tuple[int, int, int, int] | None = None
 
     @property
     def first_point(self) -> tuple[int, int] | None:
@@ -138,64 +100,63 @@ class TrackState:
         return self.points[-1] if self.points else None
 
 
-def point_in_poly(point: tuple[int, int], poly: np.ndarray) -> bool:
-    return cv2.pointPolygonTest(poly, point, False) >= 0
-
-
-def scale_normalized_zone(points, width: int, height: int) -> np.ndarray:
-    return np.array(
-        [(int(x * width), int(y * height)) for x, y in points],
-        dtype=np.int32,
-    )
-
-
-def load_roi_zones(width: int, height: int):
-    zones = {
-        "door_zone": DOOR_ZONE.copy(),
-        "approach_zone": APPROACH_ZONE.copy(),
-        "water_zone": WATER_DISPENSER_ZONE.copy(),
-    }
-
-    if not ROI_CONFIG_PATH.exists() or ROI_CONFIG_PATH.stat().st_size == 0:
-        print("ROI config not found. Using built-in default zones.")
-        return zones
-
-    try:
-        with ROI_CONFIG_PATH.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"Could not read {ROI_CONFIG_PATH}: {exc}. Using built-in default zones.")
-        return zones
-
-    config_zones = data.get("zones", {})
-    for key in zones:
-        points = config_zones.get(key, [])
-        if len(points) >= 3:
-            zones[key] = scale_normalized_zone(points, width, height)
-        else:
-            print(f"{ZONE_KEY_MAP[key]} missing or incomplete in config. Using default.")
-
-    print(f"Loaded normalized ROI zones from {ROI_CONFIG_PATH}.")
-    return zones
-
-
-def moved_enough(state: TrackState) -> bool:
-    if len(state.points) < MIN_TRACK_POINTS:
-        return False
+def movement_distance(state: TrackState) -> float:
     first = state.first_point
     last = state.last_point
     if first is None or last is None:
+        return 0.0
+    return math.hypot(last[0] - first[0], last[1] - first[1])
+
+
+def should_count_track(state: TrackState) -> bool:
+    if state.counted:
         return False
-    return math.hypot(last[0] - first[0], last[1] - first[1]) >= MIN_MOVEMENT_PX
+    if state.frames_seen < MIN_TRACK_FRAMES:
+        return False
+    if movement_distance(state) >= MIN_MOVEMENT_PX:
+        return True
+    return state.frames_seen >= STATIONARY_COUNT_FRAMES
 
 
-def draw_poly(frame, poly: np.ndarray, color: tuple[int, int, int], label: str) -> None:
-    overlay = frame.copy()
-    cv2.fillPoly(overlay, [poly], color)
-    cv2.addWeighted(overlay, 0.13, frame, 0.87, 0, frame)
-    cv2.polylines(frame, [poly], True, color, 2, cv2.LINE_AA)
-    x, y = poly[0]
-    cv2.putText(frame, label, (int(x) + 8, int(y) + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)
+def box_touches_frame_edge(box: tuple[int, int, int, int], frame_width: int, frame_height: int) -> bool:
+    x1, y1, x2, y2 = box
+    margin_x = int(frame_width * ENTRY_EDGE_MARGIN_RATIO)
+    margin_y = int(frame_height * ENTRY_EDGE_MARGIN_RATIO)
+    return x1 <= margin_x or x2 >= frame_width - margin_x or y1 <= margin_y or y2 >= frame_height - margin_y
+
+
+def should_start_new_episode(
+    state: TrackState,
+    foot: tuple[int, int],
+    box: tuple[int, int, int, int],
+    absent_frames: int,
+    frame_width: int,
+    frame_height: int,
+) -> bool:
+    if not state.counted:
+        return False
+
+    last_point = state.last_point
+    if last_point is None:
+        return False
+
+    jump_distance = math.hypot(foot[0] - last_point[0], foot[1] - last_point[1])
+    current_at_edge = box_touches_frame_edge(box, frame_width, frame_height)
+
+    if absent_frames >= REENTRY_MIN_ABSENT_FRAMES and current_at_edge:
+        return True
+
+    if jump_distance >= ID_SWITCH_DISTANCE_PX:
+        return True
+
+    return False
+
+
+def reset_for_new_episode(state: TrackState) -> None:
+    state.points.clear()
+    state.frames_seen = 0
+    state.max_conf = 0.0
+    state.counted = False
 
 
 def draw_trail(frame, points: deque[tuple[int, int]], color: tuple[int, int, int]) -> None:
@@ -222,14 +183,14 @@ def draw_person_overlay(frame, box, foot, color: tuple[int, int, int], label: st
     cv2.putText(frame, label, (x1 + 4, label_y1 + label_h + 3), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
 
 
-def draw_hud(frame, count_in: int, count_out: int, active_tracks: int) -> None:
+def draw_hud(frame, total_people: int, active_tracks: int, frame_index: int) -> None:
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (380, 148), CLR_BG, -1)
+    cv2.rectangle(overlay, (0, 0), (420, 128), CLR_BG, -1)
     cv2.addWeighted(overlay, 0.68, frame, 0.32, 0, frame)
-    cv2.putText(frame, f"IN     : {count_in}", (16, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.9, CLR_IN, 2, cv2.LINE_AA)
-    cv2.putText(frame, f"OUT    : {count_out}", (16, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.9, CLR_OUT, 2, cv2.LINE_AA)
-    cv2.putText(frame, f"INSIDE : {count_in - count_out}", (16, 118), cv2.FONT_HERSHEY_SIMPLEX, 0.9, CLR_TEXT, 2, cv2.LINE_AA)
-    cv2.putText(frame, f"TRACKS : {active_tracks}", (230, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.62, CLR_TEXT, 1, cv2.LINE_AA)
+
+    cv2.putText(frame, f"TOTAL PEOPLE : {total_people}", (16, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.95, CLR_COUNTED, 2, cv2.LINE_AA)
+    cv2.putText(frame, f"ACTIVE TRACKS: {active_tracks}", (16, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.72, CLR_TEXT, 2, cv2.LINE_AA)
+    cv2.putText(frame, f"FRAME        : {frame_index}", (16, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.62, CLR_TEXT, 1, cv2.LINE_AA)
 
 
 def resize_for_display(frame):
@@ -239,35 +200,40 @@ def resize_for_display(frame):
     return cv2.resize(frame, (DISPLAY_WIDTH, int(frame.shape[0] * scale)))
 
 
-def prune_tracks(states: dict[int, TrackState], frame_index: int) -> None:
+def prune_tracks(states: dict[str, TrackState], frame_index: int) -> None:
     stale_ids = [tid for tid, state in states.items() if frame_index - state.last_seen_frame > MAX_STALE_TRACKS]
     for tid in stale_ids:
         del states[tid]
 
 
 def run() -> None:
+    print(f"Loading model: {MODEL_PATH}")
     model = YOLO(MODEL_PATH)
-    cap = cv2.VideoCapture(VIDEO_SOURCE)
+    tracker = DeepSort(
+        max_age=DEEPSORT_MAX_AGE,
+        n_init=DEEPSORT_N_INIT,
+        max_cosine_distance=DEEPSORT_MAX_COSINE_DISTANCE,
+        nn_budget=DEEPSORT_NN_BUDGET,
+        embedder="mobilenet",
+        half=True,
+        bgr=True,
+    )
 
+    cap = cv2.VideoCapture(VIDEO_SOURCE)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video source: {VIDEO_SOURCE}")
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    roi_zones = load_roi_zones(width, height)
-    door_zone = roi_zones["door_zone"]
-    approach_zone = roi_zones["approach_zone"]
-    water_zone = roi_zones["water_zone"]
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    states: dict[int, TrackState] = defaultdict(TrackState)
-    count_in = 0
-    count_out = 0
-    last_count_time = 0.0
+    states: dict[str, TrackState] = defaultdict(TrackState)
+    total_people_count = 0
     paused = False
     frame_index = 0
     frame = None
+    active_tracks = 0
 
-    print("Running door-aware counter. Press q to quit, r to reset, p to pause.")
+    print("Running YOLOv8 + DeepSORT people counter. Press q to quit, r to reset, p to pause.")
 
     while True:
         if not paused:
@@ -276,68 +242,58 @@ def run() -> None:
                 break
             frame_index += 1
 
-            results = model.track(
+            results = model(
                 frame,
                 classes=[PERSON_CLASS_ID],
                 conf=CONF_THRESHOLD,
                 iou=IOU_THRESHOLD,
                 imgsz=IMG_SIZE,
-                tracker=TRACKER,
-                persist=True,
                 verbose=False,
             )[0]
 
-            if results.boxes.id is not None:
-                for box, tid in zip(results.boxes, results.boxes.id.int().tolist()):
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    conf = float(box.conf[0])
-                    foot = ((x1 + x2) // 2, y2)
+            detections = []
+            for box in results.boxes:
+                x1, y1, x2, y2 = map(float, box.xyxy[0])
+                conf = float(box.conf[0])
+                width = x2 - x1
+                height = y2 - y1
+                detections.append(([int(x1), int(y1), int(width), int(height)], conf, "person"))
 
-                    state = states[tid]
-                    state.last_seen_frame = frame_index
-                    state.points.append(foot)
+            tracks = tracker.update_tracks(detections, frame=frame)
+            active_tracks = 0
+            for track in tracks:
+                if not track.is_confirmed():
+                    continue
+                if track.time_since_update > 0:
+                    continue
 
-                    if point_in_poly(foot, door_zone):
-                        state.door_hits += 1
-                    if point_in_poly(foot, approach_zone):
-                        state.approach_hits += 1
-                    if point_in_poly(foot, water_zone):
-                        state.water_hits += 1
+                active_tracks += 1
+                track_id = str(track.track_id)
+                x1, y1, x2, y2 = map(int, track.to_ltrb())
+                box = (x1, y1, x2, y2)
+                foot = ((x1 + x2) // 2, y2)
 
-                    now = time.monotonic()
-                    enough_time = now - last_count_time >= COUNT_COOLDOWN_SEC
-                    stable = moved_enough(state)
-                    has_door = state.door_hits >= MIN_DOOR_HITS
-                    has_approach = state.approach_hits >= MIN_APPROACH_HITS
-                    in_door_now = point_in_poly(foot, door_zone)
-                    in_approach_now = point_in_poly(foot, approach_zone)
+                state = states[track_id]
+                absent_frames = frame_index - state.last_seen_frame if state.last_seen_frame else 0
+                if should_start_new_episode(state, foot, box, absent_frames, frame_width, frame_height):
+                    reset_for_new_episode(state)
 
-                    # Count zone transitions, not random line crossings. This is
-                    # what prevents bathroom-to-dispenser traffic from counting.
-                    if enough_time and stable and has_approach and in_door_now and not in_approach_now and not state.counted_in:
-                        count_in += 1
-                        state.counted_in = True
-                        last_count_time = now
+                state.frames_seen += 1
+                state.last_seen_frame = frame_index
+                state.last_box = box
+                state.points.append(foot)
 
-                    if enough_time and stable and has_door and in_approach_now and not in_door_now and not state.counted_out:
-                        count_out += 1
-                        state.counted_out = True
-                        last_count_time = now
+                if should_count_track(state):
+                    state.counted = True
+                    state.pass_count += 1
+                    total_people_count += 1
 
-                    is_counted = state.counted_in or state.counted_out
-                    color = CLR_COUNTED if is_counted else CLR_NOT_COUNTED
-                    draw_trail(frame, state.points, color)
+                color = CLR_COUNTED if state.counted else CLR_NOT_COUNTED
+                status = "COUNTED" if state.counted else "NOT-COUNTED"
+                label = f"ID {track_id} {status} pass:{state.pass_count} seen:{state.frames_seen}"
 
-                    status = ["COUNTED" if is_counted else "NOT-COUNTED"]
-                    if has_door:
-                        status.append("door")
-                    if has_approach:
-                        status.append("approach")
-                    if state.water_hits >= MIN_APPROACH_HITS and not has_door:
-                        status.append("water-ignore")
-
-                    label = f"ID {tid} {conf:.2f} {'/'.join(status)}"
-                    draw_person_overlay(frame, (x1, y1, x2, y2), foot, color, label)
+                draw_trail(frame, state.points, color)
+                draw_person_overlay(frame, box, foot, color, label)
 
             prune_tracks(states, frame_index)
 
@@ -345,36 +301,24 @@ def run() -> None:
             continue
 
         display = frame.copy()
-        draw_poly(display, door_zone, CLR_DOOR, "DOOR ZONE")
-        draw_poly(display, approach_zone, CLR_APPROACH, "APPROACH")
-        draw_poly(display, water_zone, CLR_WATER, "WATER/IGNORE")
-        cv2.line(display, DOOR_GATE_START, DOOR_GATE_END, (255, 255, 255), 4, cv2.LINE_AA)
-        cv2.circle(display, DOOR_GATE_START, 7, (255, 255, 255), -1)
-        cv2.circle(display, DOOR_GATE_END, 7, (255, 255, 255), -1)
-        cv2.putText(display, "DOOR GATE", (DOOR_GATE_START[0] + 10, DOOR_GATE_START[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
-        draw_hud(display, count_in, count_out, len(states))
+        draw_hud(display, total_people_count, active_tracks, frame_index)
+        cv2.imshow("YOLOv8 + DeepSORT People Counter", resize_for_display(display))
 
-        cv2.imshow("YOLOv8 Door-Aware People Counter", resize_for_display(display))
         key = cv2.waitKey(0 if paused else 1) & 0xFF
-
         if key == ord("q"):
             break
         if key == ord("p"):
             paused = not paused
         if key == ord("r"):
-            count_in = 0
-            count_out = 0
             states.clear()
-            last_count_time = 0.0
-            print("Counts reset.")
+            total_people_count = 0
+            print("Count reset.")
 
     cap.release()
     cv2.destroyAllWindows()
 
     print("\nFinal results")
-    print(f"IN     : {count_in}")
-    print(f"OUT    : {count_out}")
-    print(f"INSIDE : {count_in - count_out}")
+    print(f"Total people counted: {total_people_count}")
 
 
 if __name__ == "__main__":
