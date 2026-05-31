@@ -64,6 +64,9 @@ except Exception as exc:
 # =========================
 VIDEO_SOURCE = "entrance_stable.mp4"
 MODEL_PATH = "yolov8m.pt"
+OUTPUT_VIDEO_PATH = r"E:\Video\count_people_output.avi"
+RECORD_OUTPUT = True
+OUTPUT_SCALE = 0.5
 
 PERSON_CLASS_ID = 0
 CONF_THRESHOLD = 0.8
@@ -380,6 +383,20 @@ def run() -> None:
 
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30.0
+    output_width = max(1, int(frame_width * OUTPUT_SCALE))
+    output_height = max(1, int(frame_height * OUTPUT_SCALE))
+
+    writer = None
+    if RECORD_OUTPUT:
+        fourcc = cv2.VideoWriter_fourcc(*"XVID")
+        writer = cv2.VideoWriter(OUTPUT_VIDEO_PATH, fourcc, fps, (output_width, output_height))
+        if not writer.isOpened():
+            cap.release()
+            raise RuntimeError(f"Cannot open output video writer: {OUTPUT_VIDEO_PATH}")
+        print(f"Recording annotated output to: {OUTPUT_VIDEO_PATH} ({output_width}x{output_height})")
 
     states: dict[str, TrackState] = defaultdict(TrackState)
     total_people_count = 0
@@ -469,6 +486,9 @@ def run() -> None:
 
         display = frame.copy()
         draw_hud(display, total_people_count, active_tracks, frame_index)
+        if writer is not None and not paused:
+            output_frame = cv2.resize(display, (output_width, output_height))
+            writer.write(output_frame)
         cv2.imshow("YOLOv8 + DeepSORT People Counter", resize_for_display(display))
 
         key = cv2.waitKey(0 if paused else 1) & 0xFF
@@ -482,10 +502,14 @@ def run() -> None:
             print("Count reset.")
 
     cap.release()
+    if writer is not None:
+        writer.release()
     cv2.destroyAllWindows()
 
     print("\nFinal results")
     print(f"Total people counted: {total_people_count}")
+    if RECORD_OUTPUT:
+        print(f"Saved output video: {OUTPUT_VIDEO_PATH}")
 
 
 if __name__ == "__main__":
