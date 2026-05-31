@@ -1,5 +1,5 @@
 """
-Count people across an entire video using YOLOv8 + DeepSORT.
+Count people across an entire video using YOLOv8 + DeepSORT + optional OSNet.
 
 This does not count people per frame and does not count IN/OUT direction.
 Each stable DeepSORT tracking ID is counted once. Short occlusions/overlaps keep
@@ -7,7 +7,8 @@ the same ID, but a person who leaves the frame and comes back later can be
 counted again as a new track.
 
 Install:
-    pip install ultralytics opencv-python deep-sort-realtime
+    pip install ultralytics opencv-python deep-sort-realtime scipy torch torchvision
+    pip install torchreid
 
 Run:
     python count_people.py
@@ -23,10 +24,39 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 import math
+import sys
+import types
 
 import cv2
 from deep_sort_realtime.deepsort_tracker import DeepSort
+import numpy as np
+from scipy.spatial.distance import cosine
+import torch
+import torchvision.transforms as transforms
 from ultralytics import YOLO
+
+
+class _NoOpSummaryWriter:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def add_scalar(self, *args, **kwargs):
+        pass
+
+    def close(self):
+        pass
+
+
+if "torch.utils.tensorboard" not in sys.modules:
+    tensorboard_stub = types.ModuleType("torch.utils.tensorboard")
+    tensorboard_stub.SummaryWriter = _NoOpSummaryWriter
+    sys.modules["torch.utils.tensorboard"] = tensorboard_stub
+
+try:
+    import torchreid
+except Exception as exc:
+    print(f"torchreid import failed. OSNet re-ID disabled: {exc}")
+    torchreid = None
 
 
 # =========================
@@ -44,17 +74,26 @@ IMG_SIZE = 960
 # max_age keeps the same ID through short occlusion. If a person disappears for
 # longer than this many frames, DeepSORT deletes the track; if they return later,
 # they can be counted again as a new person pass.
-DEEPSORT_MAX_AGE = 80
+DEEPSORT_MAX_AGE = 30
 DEEPSORT_N_INIT = 3
 DEEPSORT_MAX_COSINE_DISTANCE = 0.25
 DEEPSORT_NN_BUDGET = 200
 
+# Optional OSNet re-identification. This helps detect when DeepSORT reuses the
+# same ID for a visually different person.
+USE_OSNET_REID = True
+OSNET_MODEL_NAME = "osnet_x0_25"
+OSNET_DISTANCE_THRESHOLD = 0.45
+OSNET_MIN_FRAMES_BETWEEN_NEW_PERSON = 10
+OSNET_UPDATE_EMA = 0.65
+TRACK_DETECTION_IOU_THRESHOLD = 0.25
+
 # If a counted ID disappears for a few frames and then reappears from a frame
 # edge, treat it as a new person entering the frame.
-REENTRY_MIN_ABSENT_FRAMES = 2
+REENTRY_MIN_ABSENT_FRAMES = 10
 
 # Reused IDs that jump a long distance are probably a different person.
-ID_SWITCH_DISTANCE_PX = 160
+ID_SWITCH_DISTANCE_PX = 220
 
 # A person appearing inside this edge band is treated as entering the frame.
 ENTRY_EDGE_MARGIN_RATIO = 0.08
@@ -90,6 +129,7 @@ class TrackState:
     pass_count: int = 0
     last_seen_frame: int = 0
     last_box: tuple[int, int, int, int] | None = None
+    embedding: np.ndarray | None = None
 
     @property
     def first_point(self) -> tuple[int, int] | None:
@@ -146,7 +186,7 @@ def should_start_new_episode(
     if absent_frames >= REENTRY_MIN_ABSENT_FRAMES and current_at_edge:
         return True
 
-    if jump_distance >= ID_SWITCH_DISTANCE_PX:
+    if absent_frames >= REENTRY_MIN_ABSENT_FRAMES and jump_distance >= ID_SWITCH_DISTANCE_PX:
         return True
 
     return False
@@ -157,6 +197,120 @@ def reset_for_new_episode(state: TrackState) -> None:
     state.frames_seen = 0
     state.max_conf = 0.0
     state.counted = False
+    state.embedding = None
+
+
+def build_osnet_model():
+    if not USE_OSNET_REID:
+        return None, None, None
+    if torchreid is None:
+        print("torchreid is not installed. OSNet re-ID disabled.")
+        print("Install it with: pip install torchreid")
+        return None, None, None
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = torchreid.models.build_model(
+        name=OSNET_MODEL_NAME,
+        num_classes=1000,
+        pretrained=True,
+    )
+    model.to(device)
+    model.eval()
+
+    transform = transforms.Compose(
+        [
+            transforms.ToPILImage(),
+            transforms.Resize((256, 128)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+
+    print(f"OSNet re-ID enabled on {device}.")
+    return model, transform, device
+
+
+def extract_embedding(frame, box: tuple[int, int, int, int], model, transform, device):
+    if model is None or transform is None or device is None:
+        return None
+
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = box
+    x1 = max(0, min(width - 1, x1))
+    x2 = max(0, min(width, x2))
+    y1 = max(0, min(height - 1, y1))
+    y2 = max(0, min(height, y2))
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    person_img = frame[y1:y2, x1:x2]
+    if person_img.size == 0:
+        return None
+
+    person_rgb = cv2.cvtColor(person_img, cv2.COLOR_BGR2RGB)
+    tensor = transform(person_rgb).unsqueeze(0).to(device)
+    with torch.no_grad():
+        embedding = model(tensor).squeeze(0).detach().cpu().numpy()
+
+    norm = np.linalg.norm(embedding)
+    if norm > 0:
+        embedding = embedding / norm
+    return embedding
+
+
+def smooth_embedding(old_embedding, new_embedding):
+    if old_embedding is None:
+        return new_embedding
+    smoothed = (OSNET_UPDATE_EMA * old_embedding) + ((1.0 - OSNET_UPDATE_EMA) * new_embedding)
+    norm = np.linalg.norm(smoothed)
+    if norm > 0:
+        smoothed = smoothed / norm
+    return smoothed
+
+
+def box_iou(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter_area
+    if union <= 0:
+        return 0.0
+    return inter_area / union
+
+
+def best_detection_for_track(track_box: tuple[int, int, int, int], detections: list[dict]):
+    best_detection = None
+    best_iou = 0.0
+    for detection in detections:
+        iou = box_iou(track_box, detection["box"])
+        if iou > best_iou:
+            best_iou = iou
+            best_detection = detection
+    if best_iou < TRACK_DETECTION_IOU_THRESHOLD:
+        return None
+    return best_detection
+
+
+def embedding_is_different(state: TrackState, embedding, absent_frames: int, current_at_edge: bool) -> bool:
+    if embedding is None or state.embedding is None:
+        return False
+    if absent_frames < OSNET_MIN_FRAMES_BETWEEN_NEW_PERSON:
+        return False
+    if not current_at_edge:
+        return False
+    distance = cosine(state.embedding, embedding)
+    return distance >= OSNET_DISTANCE_THRESHOLD
 
 
 def draw_trail(frame, points: deque[tuple[int, int]], color: tuple[int, int, int]) -> None:
@@ -209,6 +363,7 @@ def prune_tracks(states: dict[str, TrackState], frame_index: int) -> None:
 def run() -> None:
     print(f"Loading model: {MODEL_PATH}")
     model = YOLO(MODEL_PATH)
+    osnet_model, osnet_transform, osnet_device = build_osnet_model()
     tracker = DeepSort(
         max_age=DEEPSORT_MAX_AGE,
         n_init=DEEPSORT_N_INIT,
@@ -252,12 +407,15 @@ def run() -> None:
             )[0]
 
             detections = []
+            detection_infos = []
             for box in results.boxes:
                 x1, y1, x2, y2 = map(float, box.xyxy[0])
                 conf = float(box.conf[0])
                 width = x2 - x1
                 height = y2 - y1
+                xyxy = (int(x1), int(y1), int(x2), int(y2))
                 detections.append(([int(x1), int(y1), int(width), int(height)], conf, "person"))
+                detection_infos.append({"box": xyxy, "conf": conf})
 
             tracks = tracker.update_tracks(detections, frame=frame)
             active_tracks = 0
@@ -272,16 +430,25 @@ def run() -> None:
                 x1, y1, x2, y2 = map(int, track.to_ltrb())
                 box = (x1, y1, x2, y2)
                 foot = ((x1 + x2) // 2, y2)
+                matched_detection = best_detection_for_track(box, detection_infos)
+                embedding = None
+                if matched_detection is not None:
+                    embedding = extract_embedding(frame, matched_detection["box"], osnet_model, osnet_transform, osnet_device)
 
                 state = states[track_id]
                 absent_frames = frame_index - state.last_seen_frame if state.last_seen_frame else 0
-                if should_start_new_episode(state, foot, box, absent_frames, frame_width, frame_height):
+                current_at_edge = box_touches_frame_edge(box, frame_width, frame_height)
+                new_by_geometry = should_start_new_episode(state, foot, box, absent_frames, frame_width, frame_height)
+                new_by_reid = embedding_is_different(state, embedding, absent_frames, current_at_edge)
+                if new_by_geometry or new_by_reid:
                     reset_for_new_episode(state)
 
                 state.frames_seen += 1
                 state.last_seen_frame = frame_index
                 state.last_box = box
                 state.points.append(foot)
+                if embedding is not None:
+                    state.embedding = smooth_embedding(state.embedding, embedding)
 
                 if should_count_track(state):
                     state.counted = True
