@@ -113,6 +113,8 @@ CLR_APPROACH = (70, 220, 70)
 CLR_WATER = (255, 170, 0)
 CLR_IN = (40, 210, 80)
 CLR_OUT = (40, 90, 235)
+CLR_COUNTED = (0, 220, 0)
+CLR_NOT_COUNTED = (0, 0, 255)
 CLR_TEXT = (245, 245, 245)
 CLR_BG = (25, 25, 25)
 
@@ -187,22 +189,6 @@ def moved_enough(state: TrackState) -> bool:
     return math.hypot(last[0] - first[0], last[1] - first[1]) >= MIN_MOVEMENT_PX
 
 
-def id_color(track_id: int) -> tuple[int, int, int]:
-    palette = [
-        (255, 110, 80),
-        (80, 200, 255),
-        (255, 220, 50),
-        (150, 255, 100),
-        (210, 90, 255),
-        (255, 150, 50),
-        (80, 255, 205),
-        (255, 90, 180),
-        (115, 180, 255),
-        (245, 245, 105),
-    ]
-    return palette[track_id % len(palette)]
-
-
 def draw_poly(frame, poly: np.ndarray, color: tuple[int, int, int], label: str) -> None:
     overlay = frame.copy()
     cv2.fillPoly(overlay, [poly], color)
@@ -218,6 +204,22 @@ def draw_trail(frame, points: deque[tuple[int, int]], color: tuple[int, int, int
         alpha = i / max(1, len(pts) - 1)
         faded = tuple(int(c * alpha) for c in color)
         cv2.line(frame, pts[i - 1], pts[i], faded, max(1, int(3 * alpha)), cv2.LINE_AA)
+
+
+def draw_person_overlay(frame, box, foot, color: tuple[int, int, int], label: str) -> None:
+    x1, y1, x2, y2 = box
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+    cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, frame)
+
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+    cv2.circle(frame, foot, 5, (255, 255, 255), -1)
+    cv2.circle(frame, foot, 7, color, 2)
+
+    (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 2)
+    label_y1 = max(0, y1 - label_h - 10)
+    cv2.rectangle(frame, (x1, label_y1), (x1 + label_w + 8, label_y1 + label_h + 8), color, -1)
+    cv2.putText(frame, label, (x1 + 4, label_y1 + label_h + 3), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
 
 
 def draw_hud(frame, count_in: int, count_out: int, active_tracks: int) -> None:
@@ -289,7 +291,6 @@ def run() -> None:
                 for box, tid in zip(results.boxes, results.boxes.id.int().tolist()):
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     conf = float(box.conf[0])
-
                     foot = ((x1 + x2) // 2, y2)
 
                     state = states[tid]
@@ -323,21 +324,20 @@ def run() -> None:
                         state.counted_out = True
                         last_count_time = now
 
-                    color = id_color(tid)
+                    is_counted = state.counted_in or state.counted_out
+                    color = CLR_COUNTED if is_counted else CLR_NOT_COUNTED
                     draw_trail(frame, state.points, color)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.circle(frame, foot, 5, (255, 255, 255), -1)
-                    cv2.circle(frame, foot, 6, color, 2)
 
-                    status = []
+                    status = ["COUNTED" if is_counted else "NOT-COUNTED"]
                     if has_door:
                         status.append("door")
                     if has_approach:
                         status.append("approach")
                     if state.water_hits >= MIN_APPROACH_HITS and not has_door:
                         status.append("water-ignore")
+
                     label = f"ID {tid} {conf:.2f} {'/'.join(status)}"
-                    cv2.putText(frame, label, (x1, max(22, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+                    draw_person_overlay(frame, (x1, y1, x2, y2), foot, color, label)
 
             prune_tracks(states, frame_index)
 
