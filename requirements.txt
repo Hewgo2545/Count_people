@@ -1,0 +1,9 @@
+ultralytics
+opencv-python
+boxmot
+numpy
+scipy
+torch
+torchvision
+torchreid
+gdown
