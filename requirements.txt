@@ -7,3 +7,4 @@ torch
 torchvision
 torchreid
 gdown
+deep-sort-realtime
