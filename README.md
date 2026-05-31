@@ -1,13 +1,13 @@
-# People Counting With YOLOv8, DeepOCSORT, and OSNet
+# People Counting With YOLOv8, Deepsort, and OSNet
 
-This project counts people across a video using YOLOv8 detections and DeepOCSORT tracking from BoxMOT. It is designed for crowded/overlapping scenes where a person may be partially hidden and then reappear.
+This project counts people across a video using YOLOv8 detections and Deepsort tracking from BoxMOT. It is designed for crowded/overlapping scenes where a person may be partially hidden and then reappear.
 
 The current main script is `count_people.py`.
 
 ## Features
 
 - Detects people with YOLOv8.
-- Tracks people with DeepOCSORT.
+- Tracks people with Deepsort.
 - Optionally uses OSNet re-identification to reduce wrong ID reuse.
 - Counts stable tracked people instead of counting every frame.
 - Shows red overlay for not-counted tracks and green overlay for counted tracks.
@@ -80,12 +80,12 @@ Detection confidence:
 CONF_THRESHOLD = 0.8
 ```
 
-DeepOCSORT memory:
+Deepsort memory:
 
 ```python
-DEEPOCSORT_MAX_AGE = 30
-DEEPOCSORT_MIN_HITS = 3
-DEEPOCSORT_IOU_THRESHOLD = 0.3
+Deepsort_MAX_AGE = 30
+Deepsort_MIN_HITS = 3
+Deepsort_IOU_THRESHOLD = 0.3
 ```
 
 Counting stability:
@@ -115,7 +115,7 @@ If people turn front-to-back and get duplicate IDs, try:
 
 ```python
 USE_OSNET_REID = False
-DEEPOCSORT_MAX_AGE = 60
+Deepsort_MAX_AGE = 60
 ```
 
 ## Video Stabilization
